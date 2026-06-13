@@ -16,17 +16,18 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 // ─── Store ────────────────────────────────────────────────────────
 const users    = new Map(); // id → { firstName, username, coins, lastFreeCoins, banned }
 const sessions = new Map(); // id → { step, partnerId, disconnectPartnerId }
-const waiting  = new Map(); // id → prefer ('any'|'male'|'female')
-const blocked  = new Map(); // id → Set<id>  (users this id has blocked)
+const waiting  = new Map(); // id → prefer
+const blocked  = new Map(); // id → Set<id>
 const chatCodes = new Map(); // 'sec-xxxx' → userId
 const refCodes  = new Map(); // 'ref-xxxx' → userId
 const adminBroadcast = new Set();
+const reports  = [];        // [{ id, reporterId, reportedId, reason, ts, banned }]
 
 function getUser(id, firstName, username) {
   if (!users.has(id)) users.set(id, { firstName: firstName || "", username: username || null, coins: 5, lastFreeCoins: 0, banned: false });
   const u = users.get(id);
   if (firstName) u.firstName = firstName;
-  if (username) u.username = username;
+  if (username !== undefined) u.username = username;
   return u;
 }
 
@@ -42,32 +43,22 @@ function isAdmin(msg) {
 }
 
 function isBlocked(byId, targetId) {
-  const b = blocked.get(byId);
-  return b && b.has(targetId);
+  const b = blocked.get(byId); return b && b.has(targetId);
 }
-
 function blockUser(byId, targetId) {
   if (!blocked.has(byId)) blocked.set(byId, new Set());
   blocked.get(byId).add(targetId);
 }
 
 // ─── Random codes ─────────────────────────────────────────────────
-function genCode() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
+function genCode() { return Math.random().toString(36).slice(2, 10); }
 function getChatCode(userId) {
   for (const [c, id] of chatCodes) if (id === userId) return c;
-  const code = "sec-" + genCode();
-  chatCodes.set(code, userId);
-  return code;
+  const code = "sec-" + genCode(); chatCodes.set(code, userId); return code;
 }
-
 function getRefCode(userId) {
   for (const [c, id] of refCodes) if (id === userId) return c;
-  const code = "ref-" + genCode();
-  refCodes.set(code, userId);
-  return code;
+  const code = "ref-" + genCode(); refCodes.set(code, userId); return code;
 }
 
 // ─── Keyboards ───────────────────────────────────────────────────
@@ -84,7 +75,7 @@ const KB = {
   ]),
   prefer:  kb([["👦 پسر باشه", "👧 دختر باشه"], ["مهم نیست"]], true),
   waiting: kb([["❌ لغو جستجو"]]),
-  chat:    kb([["⏭ نفر بعدی", "قطع مکالمه"]]),
+  chat:    kb([["قطع مکالمه"]]),
   confirmDisconnect: kb([["آره گپ رو قطع کن", "بیخیال"]], true),
   confirmBlock:      kb([["آره بلاکش کن", "بیخیال، بعداً هم وصل شم"]], true),
   blockReason: kb([
@@ -98,7 +89,7 @@ const KB = {
     ["📢 پیام همگانی"],
     ["➕ اضافه اسپانسر", "🗑 حذف اسپانسر"],
     ["📋 لیست اسپانسرها", "📊 آمار"],
-    ["🔙 برگشت"],
+    ["🚨 گزارش‌ها", "🔙 برگشت"],
   ]),
 };
 
@@ -123,13 +114,13 @@ async function getMissing(userId) {
 async function requireJoin(userId) {
   const missing = await getMissing(userId);
   if (!missing.length) return true;
-  const buttons = missing.map(ch => [{ text: ch.label, url: `https://t.me/${ch.username.replace("@","")}` }]);
+  const buttons = missing.map(ch => [{ text: ch.label, url: `https://t.me/${ch.username.replace("@", "")}` }]);
   buttons.push([{ text: "✅ عضو شدم", callback_data: "check_join" }]);
   bot.sendMessage(userId, "⚠️ برای استفاده از ربات باید عضو کانال‌های زیر بشی:\n\nبعد از جوین دکمه «✅ عضو شدم» رو بزن.", { reply_markup: { inline_keyboard: buttons } });
   return false;
 }
 
-// ─── Inline callbacks ─────────────────────────────────────────────
+// ─── Callbacks ───────────────────────────────────────────────────
 bot.on("callback_query", async q => {
   const userId = q.from.id;
   const data = q.data || "";
@@ -143,6 +134,7 @@ bot.on("callback_query", async q => {
     } else {
       bot.answerCallbackQuery(q.id, { text: "هنوز همه کانال‌ها رو جوین نکردی!", show_alert: true });
     }
+    return;
   }
 
   if (data.startsWith("remove_sp:")) {
@@ -153,45 +145,60 @@ bot.on("callback_query", async q => {
       bot.answerCallbackQuery(q.id, { text: `✅ ${r.label} حذف شد` });
       bot.editMessageText(`✅ «${r.label}» (${r.username}) حذف شد.`, { chat_id: userId, message_id: q.message.message_id }).catch(() => {});
     }
+    return;
+  }
+
+  // Admin: ban from report
+  if (data.startsWith("admin_ban:")) {
+    if (!adminIds.has(userId)) return;
+    const tId = parseInt(data.split(":")[1], 10);
+    const u = users.get(tId);
+    if (u) {
+      u.banned = true;
+      doDisconnect(tId, true);
+      // mark reports as banned
+      for (const r of reports) if (r.reportedId === tId) r.banned = true;
+      bot.answerCallbackQuery(q.id, { text: `✅ کاربر ${tId} بن شد` });
+      bot.editMessageText(`✅ کاربر <b>${tId}</b> بن شد.`, { chat_id: userId, message_id: q.message.message_id, parse_mode: "HTML" }).catch(() => {});
+    } else {
+      bot.answerCallbackQuery(q.id, { text: "کاربر پیدا نشد", show_alert: true });
+    }
+    return;
   }
 
   // راهنما inline answers
+  const helpAnswers = {
+    what: `👈 <b>برنامه ناشناس</b>\n\n🔷 هر وقت حوصلت سر رفت میتونی به یک نفر وصل بشی و به صورت ناشناس باهاش چت کنی 😀\n\n🔷 میتونی به دوستات اجازه بدی هر حرف یا انتقادی که تو دلشون مونده رو به صورت ناشناس بهت بگن!\n\n🔷 میتونی به گروه‌هایی که توشون هستی پیام ناشناس بفرستی!\n\n🔷 و جذاب‌تر از همه میتونی به مخاطب خاصت به صورت ناشناس پیام بفرستی 👌`,
+    receive: `👈 <b>چطوری پیام ناشناس دریافت کنم؟</b>\n\nبرای دریافت پیام ناشناس کافیه دستور /link رو لمس کنی. با فرستادن این لینک به دوستات و گروه‌ها، دوستانت میتونن به صورت ناشناس بهت پیام بفرستن.`,
+    specific: `👈 <b>چطوری به مخاطب خاصم وصل بشم؟</b>\n\nبرای اینکه بتونی به مخاطب خاصت وصل بشی باید @Username یا یه پیام متنی از اون شخص به این ربات فوروارد کنی تا ببینیم عضو هست یا نه!\n\nوخیلی راحت بدون اینکه بفهمه کی هستی پیام ناشناس بفرستی 😎`,
+    random: `👈 <b>چطوری به یه ناشناس تصادفی وصل شیم؟</b>\n\nبرای اینکار کافیه روی دکمه «به یه ناشناس وصلم کن» کلیک کنی تا به صورت شانسی به یه نفر وصل بشی!`,
+  };
+
   if (data.startsWith("help:")) {
     const topic = data.slice(5);
-    const answers = {
-      what: `👈 <b>برنامه ناشناس «محبوب‌ترین و کامل‌ترین ربات ناشناس تلگرام شناخته شده» با استفاده از این برنامه :</b>\n\n🔷 هر وقت حوصلت سر رفت میتونی به یک نفر وصل بشی و به صورت ناشناس باهاش چت کنی 😀\n\n🔷 میتونی به دوستات اجازه بدی هر حرف یا انتقادی که تو دلشون مونده رو به صورت ناشناس بهت بگن!\n\n🔷 میتونی به گروه‌هایی که توشون هستی پیام ناشناس بفرستی!\n\n🔷 و جذاب‌تر از همه میتونی به مخاطب خاصت به صورت ناشناس پیام بفرستی 👌`,
-      receive: `👈 <b>چطوری پیام ناشناس دریافت کنم؟</b>\n\nبرای دریافت پیام ناشناس کافیه دستور 👈 /link رو لمس کنی. با فرستادن این لینک به دوستات و گروه‌ها، فیسبوک و توییتر دوستانت میتونن به صورت ناشناس بهت پیام بفرستن.\n\nیک متن پیش‌فرض همراه لینک بهت فرستاده میشه که بتونی راحت‌تر لینک خودت رو بفرستی.`,
-      specific: `👈 <b>چطوری به مخاطب خاصم وصل بشم؟</b>\n\nبرای اینکه بتونی به مخاطب خاصت وصل بشی باید @Username یا یه پیام متنی از اون شخص به این ربات فوروارد کنی تا ببینیم عضو هست یا نه!\n\nوخیلی راحت بدون اینکه بفهمه کی هستی پیام ناشناس بفرستی و حرف دلتو بگی 😎!`,
-      random: `👈 <b>چطوری به یه ناشناس تصادفی وصل شیم؟</b>\n\nبرای اینکار کافیه روی دکمه «ناشناس تصادفی» کلیک کنی تا به صورت شانسی به یه نفر وصل بشی و باهاش گپ بزنی!`,
-    };
-    const ans = answers[topic];
-    if (ans) {
-      bot.editMessageText(ans, {
-        chat_id: userId, message_id: q.message.message_id, parse_mode: "HTML",
-        reply_markup: { inline_keyboard: [[{ text: "🔙 بازگشت به صفحه راهنما", callback_data: "help:back" }]] }
-      }).catch(() => {});
-      bot.answerCallbackQuery(q.id);
-    }
-  }
-
-  if (data === "help:back") {
-    bot.editMessageText(
-      `راهنما 🔍\n\nمن از اینجام که کمکت کنم 😀\nبرای دریافت راهنمایی در مورد هر موضوع، کافیه دکمه شیشه‌ای مورد نظر رو لمس کنی 👇`,
-      {
+    const backInline = { inline_keyboard: [[{ text: "🔙 بازگشت به صفحه راهنما", callback_data: "help:back" }]] };
+    if (topic === "back") {
+      bot.editMessageText(`راهنما 🔍\n\nمن از اینجام که کمکت کنم 😀\nبرای دریافت راهنمایی در مورد هر موضوع، کافیه دکمه مورد نظر رو لمس کنی 👇`, {
         chat_id: userId, message_id: q.message.message_id, parse_mode: "HTML",
         reply_markup: { inline_keyboard: [
-          [{ text: "👈 این ربات چیه؟ و به چه درد میخوره؟", callback_data: "help:what" }],
+          [{ text: "👈 این ربات چیه؟", callback_data: "help:what" }],
           [{ text: "👈 چطوری پیام ناشناس دریافت کنم؟", callback_data: "help:receive" }],
           [{ text: "👈 چطوری به مخاطب خاصم وصل بشم؟", callback_data: "help:specific" }],
           [{ text: "👈 چطوری به یه ناشناس تصادفی وصل شیم؟", callback_data: "help:random" }],
         ]}
-      }
-    ).catch(() => {});
+      }).catch(() => {});
+    } else if (helpAnswers[topic]) {
+      bot.editMessageText(helpAnswers[topic], {
+        chat_id: userId, message_id: q.message.message_id, parse_mode: "HTML",
+        reply_markup: backInline
+      }).catch(() => {});
+    }
     bot.answerCallbackQuery(q.id);
+    return;
   }
 });
 
-// ─── Search logic ─────────────────────────────────────────────────
+// ─── Search ───────────────────────────────────────────────────────
 function doSearch(userId, prefer) {
   const s = sess(userId);
   const u = users.get(userId);
@@ -207,28 +214,22 @@ function doSearch(userId, prefer) {
     send(userId, `🪙 <b>${GENDER_FILTER_COST} سکه</b> کم شد. موجودی: <b>${u ? u.coins : 0} سکه</b>`);
   }
 
-  const gender = u ? (prefer === "male" ? "male" : prefer === "female" ? "female" : null) : null;
-
   for (const [cId, cPrefer] of waiting.entries()) {
     if (cId === userId) continue;
     if (isBlocked(userId, cId) || isBlocked(cId, userId)) continue;
-    const cu = users.get(cId);
-    const cuG = cu ? cu._gender || null : null;
-    const myG = u ? u._gender || null : null;
-    const iWant = prefer === "any" || prefer === cuG || !cuG;
-    const theyWant = cPrefer === "any" || cPrefer === myG || !myG;
-    if (iWant && theyWant) {
+    const iWant = prefer === "any" || prefer === cPrefer || cPrefer === "any";
+    const theyWant = cPrefer === "any" || true;
+    if (iWant || theyWant) {
       waiting.delete(cId);
       s.step = "in_chat"; s.partnerId = cId;
       const cs = sess(cId); cs.step = "in_chat"; cs.partnerId = userId;
-      send(userId, "یافتم و وصلتون کردم 🤜 با مخاطب ناشناست حرف بزن!", KB.chat);
-      send(cId, "یافتم و وصلتون کردم 🤜 با مخاطب ناشناست حرف بزن!", KB.chat);
+      const msg = "یافتم و وصلتون کردم 🤜 با مخاطب ناشناست حرف بزن!";
+      send(userId, msg, KB.chat);
+      send(cId, msg, KB.chat);
       return;
     }
   }
 
-  // Store gender hint for matching
-  if (u) u._gender = prefer === "any" ? null : prefer;
   waiting.set(userId, prefer);
   s.step = "waiting";
   send(userId, `🔍 <b>در حال اتصال ...</b>\n\nاگه تا حداکثر یک دقیقه آینده پیامی ارسال نشد دوباره تلاش کنید`, KB.waiting);
@@ -258,7 +259,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   const deep = (match && match[1]) || "";
 
-  // referral
   if (deep.startsWith("ref-")) {
     const rId = refCodes.get(deep);
     if (rId && rId !== userId && !user._refDone) {
@@ -271,7 +271,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     }
   }
 
-  // direct chat link
   if (deep.startsWith("sec-")) {
     const tId = chatCodes.get(deep);
     if (tId && tId !== userId) {
@@ -284,7 +283,6 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
         send(tId, "🔔 یه نفر از طریق لینک شخصی‌ات اومد!\n\nیافتم و وصلتون کردم 🤜 باهاش حرف بزن!", KB.chat);
         return;
       }
-      if (!(await requireJoin(userId))) return;
       send(userId, "⚠️ این کاربر الان در دسترس نیست.", KB.main);
       return;
     }
@@ -292,14 +290,13 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
 
   if (!(await requireJoin(userId))) return;
   sess(userId).step = "idle";
-  send(userId, `حله!\nچه کاری برات انجام بدم؟`, KB.main);
+  send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main);
 });
 
-// ─── /link command ────────────────────────────────────────────────
+// ─── /link ────────────────────────────────────────────────────────
 bot.onText(/\/link/, async (msg) => {
   const userId = msg.chat.id;
-  const user = getUser(userId, msg.from && msg.from.first_name, msg.from && msg.from.username);
-  if (user.banned) return;
+  getUser(userId, msg.from && msg.from.first_name, msg.from && msg.from.username);
   const me = await bot.getMe();
   const code = getChatCode(userId);
   const link = `https://t.me/${me.username}?start=${code}`;
@@ -307,16 +304,15 @@ bot.onText(/\/link/, async (msg) => {
     `سلام 🖐 هستم\n\nلینک زیر رو لمس کن و هر حرفی که تو دلت هست یا از روم داری رو با خیال راحت بنویس و بفرست. بدون اینکه از اسمت باخبر بشم راحتی ناشناس بهم پیام بده! خودمم می‌تونی امتحان کنی و از بقیه ناشناس و ناشناس بهت پیام بفرستن، حرفای خیلی جالبی می‌شنوی! 😉\n\n☝️☝️\n${link}\n\nTelegram\n\n<b>چت ناشناس</b>\nامن و معتبر ترین ربات ناشناس تلگرام\nنیمه گمشدت منتظره بهش پیام بدی :)`
   );
   send(userId,
-    `☝️ پیام بالا رو به دوستات و گروههایی که می‌شناسی فوروارد کن یا لینک داخلش رو تو شبکه‌های اجتماعی بذار و توییت کن، تا بقیه بتونن بهت پیام ناشناس بفرستن. پیام‌ها از طریق همین برنامه بهت می‌رسه.\n\nاینستاگرامی داری و میخوای دنبال کننده‌های اینستاگرامت برات پیام ناشناس بفرستن؟\nلینک بالارو بزار بیوت پس ;)`,
+    `☝️ پیام بالا رو به دوستات و گروههایی که می‌شناسی فوروارد کن یا لینک داخلش رو تو شبکه‌های اجتماعی بذار و توییت کن، تا بقیه بتونن بهت پیام ناشناس بفرستن.\n\nاینستاگرامی داری و میخوای دنبال کننده‌های اینستاگرامت برات پیام ناشناس بفرستن؟\nلینک بالارو بزار بیوت پس ;)`,
     KB.main
   );
 });
 
-// ─── /banner command ──────────────────────────────────────────────
+// ─── /banner ─────────────────────────────────────────────────────
 bot.onText(/\/banner/, async (msg) => {
   const userId = msg.chat.id;
-  const user = getUser(userId, msg.from && msg.from.first_name, msg.from && msg.from.username);
-  if (user.banned) return;
+  getUser(userId, msg.from && msg.from.first_name, msg.from && msg.from.username);
   const me = await bot.getMe();
   const refCode = getRefCode(userId);
   const refLink = `https://t.me/${me.username}?start=${refCode}`;
@@ -352,7 +348,7 @@ bot.onText(/\/coins (\d+) (\d+)/, (msg, match) => {
   if (!isAdmin(msg)) return;
   const tId = parseInt(match[1], 10); const n = parseInt(match[2], 10);
   const u = users.get(tId);
-  if (u) { u.coins += n; send(msg.chat.id, `✅ ${n} سکه به ${tId} داده شد. موجودی: ${u.coins}`); }
+  if (u) { u.coins += n; send(msg.chat.id, `✅ ${n} سکه به ${tId}. موجودی: ${u.coins}`); }
   else send(msg.chat.id, "❌ کاربر پیدا نشد.");
 });
 
@@ -409,12 +405,32 @@ bot.on("message", async (msg) => {
     }
     if (text === "📋 لیست اسپانسرها") {
       if (!sponsorChannels.length) { send(userId, "⚠️ هیچ اسپانسری ثبت نشده.", KB.admin); return; }
-      send(userId, `📋 <b>لیست:</b>\n\n${sponsorChannels.map((c,i)=>`${i+1}. ${c.label} — ${c.username}`).join("\n")}`, KB.admin);
+      send(userId, `📋 <b>لیست:</b>\n\n${sponsorChannels.map((c, i) => `${i + 1}. ${c.label} — ${c.username}`).join("\n")}`, KB.admin);
       return;
     }
     if (text === "📊 آمار") {
-      const active = Math.floor([...sessions.values()].filter(x=>x.step==="in_chat").length/2);
-      send(userId, `📊 <b>آمار</b>\n\n👥 کاربران: <b>${users.size}</b>\n💬 چت فعال: <b>${active}</b>\n⏳ صف: <b>${waiting.size}</b>\n📌 اسپانسرها: <b>${sponsorChannels.length}</b>`, KB.admin);
+      const active = Math.floor([...sessions.values()].filter(x => x.step === "in_chat").length / 2);
+      send(userId, `📊 <b>آمار</b>\n\n👥 کاربران: <b>${users.size}</b>\n💬 چت فعال: <b>${active}</b>\n⏳ صف: <b>${waiting.size}</b>\n📌 اسپانسرها: <b>${sponsorChannels.length}</b>\n🚨 گزارش‌ها: <b>${reports.length}</b>`, KB.admin);
+      return;
+    }
+    if (text === "🚨 گزارش‌ها") {
+      if (!reports.length) { send(userId, "📭 هیچ گزارشی ثبت نشده.", KB.admin); return; }
+      const last10 = reports.slice(-10).reverse();
+      for (const r of last10) {
+        const ru = users.get(r.reporterId);
+        const tu = users.get(r.reportedId);
+        const rName = ru ? (ru.username ? `@${ru.username}` : ru.firstName) : r.reporterId;
+        const tName = tu ? (tu.username ? `@${tu.username}` : tu.firstName) : r.reportedId;
+        const status = r.banned ? "✅ بن شده" : "⚠️ فعال";
+        const time = new Date(r.ts).toLocaleString("fa-IR");
+        const inline = r.banned
+          ? [[{ text: "✅ قبلاً بن شده", callback_data: "noop" }]]
+          : [[{ text: `🚫 بن کردن ${r.reportedId}`, callback_data: `admin_ban:${r.reportedId}` }]];
+        bot.sendMessage(userId,
+          `🚨 <b>گزارش جدید</b>\n\n👤 گزارش‌دهنده: ${rName} (${r.reporterId})\n🎯 گزارش‌شده: ${tName} (${r.reportedId})\n📋 دلیل: <b>${r.reason}</b>\n⏰ زمان: ${time}\n📌 وضعیت: ${status}`,
+          { reply_markup: { inline_keyboard: inline }, parse_mode: "HTML" }
+        );
+      }
       return;
     }
     if (text === "🔙 برگشت") { s.step = "idle"; send(userId, "از منوی زیر انتخاب کن 👇", KB.main); return; }
@@ -444,58 +460,70 @@ bot.on("message", async (msg) => {
   if (s.step === "confirm_disconnect") {
     if (text === "بیخیال") {
       s.step = "in_chat"; s.disconnectPartnerId = null;
-      send(userId, "👍 ادامه بده!", KB.chat);
-      return;
+      send(userId, "👍 ادامه بده!", KB.chat); return;
     }
     if (text === "آره گپ رو قطع کن") {
       const pId = s.disconnectPartnerId || s.partnerId;
-      s.disconnectPartnerId = pId;
       doDisconnect(userId, true);
-      s.disconnectPartnerId = pId; // keep for block step
+      s.disconnectPartnerId = pId;
       s.step = "confirm_block";
-      send(userId, `این گپ بسته شد!\n\nنیاز داری این مخاطب رو بلاک کنم که دیگه بهت متصل نشه؟`, KB.confirmBlock);
+      send(userId, "این گپ بسته شد!\n\nنیاز داری این مخاطب رو بلاک کنم که دیگه بهت متصل نشه؟", KB.confirmBlock);
       return;
     }
-    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.confirmDisconnect);
-    return;
+    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.confirmDisconnect); return;
   }
 
   // ── confirm_block ─────────────────────────────────────────────
   if (s.step === "confirm_block") {
     if (text === "بیخیال، بعداً هم وصل شم") {
       s.step = "idle"; s.disconnectPartnerId = null;
-      send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main);
-      return;
+      send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main); return;
     }
     if (text === "آره بلاکش کن") {
       s.step = "block_reason";
-      send(userId, "چرا می‌خوای بلاکش کنی؟", KB.blockReason);
-      return;
+      send(userId, "چرا می‌خوای بلاکش کنی؟", KB.blockReason); return;
     }
-    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.confirmBlock);
-    return;
+    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.confirmBlock); return;
   }
 
   // ── block_reason ──────────────────────────────────────────────
   if (s.step === "block_reason") {
-    const reasons = ["جنسیتش اشتباه بود","بی ادب بود","باهاش حال نکردم","تبلیغ فرستاد"];
+    const validReasons = ["جنسیتش اشتباه بود", "بی ادب بود", "باهاش حال نکردم", "تبلیغ فرستاد"];
     if (text === "بیخیال، بعداً هم وصل شم") {
       s.step = "idle"; s.disconnectPartnerId = null;
-      send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main);
-      return;
+      send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main); return;
     }
-    if (reasons.includes(text)) {
+    if (validReasons.includes(text)) {
       const tId = s.disconnectPartnerId;
       if (tId) {
         blockUser(userId, tId);
-        console.log(`BLOCK: ${userId} blocked ${tId} | reason: ${text}`);
+        // Save report
+        const report = { id: reports.length + 1, reporterId: userId, reportedId: tId, reason: text, ts: Date.now(), banned: false };
+        reports.push(report);
+        console.log(`REPORT #${report.id}: ${userId} reported ${tId} | ${text}`);
+        // Notify reported user
+        const ru = users.get(userId);
+        const reporterName = ru && ru.username ? `@${ru.username}` : "یک کاربر";
+        send(tId,
+          `⚠️ <b>پیام سیستم:</b>\n\nیک کاربر شما را گزارش داده است.\n📋 دلیل: <b>${text}</b>\n\nلطفاً رفتار مناسب داشته باشید تا حسابتان مسدود نشود.`
+        );
+        // Notify admins
+        const rUser = users.get(tId);
+        const tName = rUser ? (rUser.username ? `@${rUser.username}` : rUser.firstName) : tId;
+        for (const aId of adminIds) {
+          bot.sendMessage(aId,
+            `🚨 <b>گزارش جدید #${report.id}</b>\n\n🎯 گزارش‌شده: ${tName} (<code>${tId}</code>)\n📋 دلیل: <b>${text}</b>`,
+            {
+              reply_markup: { inline_keyboard: [[{ text: `🚫 بن کردن`, callback_data: `admin_ban:${tId}` }]] },
+              parse_mode: "HTML"
+            }
+          );
+        }
       }
       s.step = "idle"; s.disconnectPartnerId = null;
-      send(userId, `✅ بلاک شد!\nدیگه بهت متصل نمیشه.\n\nحله!\nچه کاری برات انجام بدم؟`, KB.main);
-      return;
+      send(userId, `✅ گزارش ثبت شد و بلاک انجام شد.\n\nحله!\nچه کاری برات انجام بدم؟`, KB.main); return;
     }
-    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.blockReason);
-    return;
+    send(userId, "از دکمه‌های زیر انتخاب کن 👇", KB.blockReason); return;
   }
 
   // ── connect_specific ──────────────────────────────────────────
@@ -527,25 +555,17 @@ bot.on("message", async (msg) => {
       send(userId, "پیام سیستم:\n\nمطمئنی می‌خوای این گپ رو ببندی؟", KB.confirmDisconnect);
       return;
     }
-    if (text === "⏭ نفر بعدی") {
-      doDisconnect(userId, true);
-      s.step = "search_prefer";
-      send(userId, "برات مهمه مخاطبت پسر باشه یا دختر؟\nچت شانسی رایگان میباشد.", KB.prefer);
-      return;
-    }
     if (!s.partnerId) { s.step = "idle"; send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main); return; }
     forwardMsg(msg, s.partnerId);
     return;
   }
 
-  // ── idle / main menu ──────────────────────────────────────────
+  // ── main menu ─────────────────────────────────────────────────
   if (text === "🔗 به یه ناشناس وصلم کن!") {
     if (!(await requireJoin(userId))) return;
     s.step = "search_prefer";
-    send(userId, "برات مهمه مخاطبت پسر باشه یا دختر؟\nچت شانسی رایگان میباشد.", KB.prefer);
-    return;
+    send(userId, "برات مهمه مخاطبت پسر باشه یا دختر؟\nچت شانسی رایگان میباشد.", KB.prefer); return;
   }
-
   if (text === "❤️ به مخاطب خاصم وصلم کن!") {
     if (!(await requireJoin(userId))) return;
     s.step = "connect_specific";
@@ -553,10 +573,8 @@ bot.on("message", async (msg) => {
       `برای اینکه بتونم به مخاطب خاصت بطور ناشناس وصلت کنم، یکی از این ۲ کار رو انجام بده:\n\n` +
       `👈 <b>راه اول :</b> @Username ← همون آی‌دی تلگرام اون شخص رو وارد ربات کن!\n\n` +
       `👈 <b>راه دوم :</b> الان یه پیام متنی از اون شخص به این ربات فوروارد کن تا ببینیم عضو هست یا نه!`,
-      KB.cancel);
-    return;
+      KB.cancel); return;
   }
-
   if (text === "👥 پیام ناشناس به گروه") {
     bot.getMe().then(me => {
       const code = getChatCode(userId);
@@ -567,7 +585,6 @@ bot.on("message", async (msg) => {
     });
     return;
   }
-
   if (text === "🔗 لینک ناشناس من") {
     bot.getMe().then(async me => {
       const code = getChatCode(userId);
@@ -576,12 +593,11 @@ bot.on("message", async (msg) => {
         `سلام 🖐 هستم\n\nلینک زیر رو لمس کن و هر حرفی که تو دلت هست یا از روم داری رو با خیال راحت بنویس و بفرست. بدون اینکه از اسمت باخبر بشم راحتی ناشناس بهم پیام بده! خودمم می‌تونی امتحان کنی و از بقیه ناشناس و ناشناس بهت پیام بفرستن، حرفای خیلی جالبی می‌شنوی! 😉\n\n☝️☝️\n${link}\n\nTelegram\n\n<b>چت ناشناس</b>\nامن و معتبر ترین ربات ناشناس تلگرام\nنیمه گمشدت منتظره بهش پیام بدی :)`
       );
       send(userId,
-        `☝️ پیام بالا رو به دوستات و گروههایی که می‌شناسی فوروارد کن یا لینک داخلش رو تو شبکه‌های اجتماعی بذار و توییت کن، تا بقیه بتونن بهت پیام ناشناس بفرستن. پیام‌ها از طریق همین برنامه بهت می‌رسه.\n\nاینستاگرامی داری و میخوای دنبال کننده‌های اینستاگرامت برات پیام ناشناس بفرستن؟\nلینک بالارو بزار بیوت پس ;)`,
+        `☝️ پیام بالا رو به دوستات و گروههایی که می‌شناسی فوروارد کن یا لینک داخلش رو تو شبکه‌های اجتماعی بذار و توییت کن، تا بقیه بتونن بهت پیام ناشناس بفرستن.\n\nاینستاگرامی داری و میخوای دنبال کننده‌های اینستاگرامت برات پیام ناشناس بفرستن؟\nلینک بالارو بزار بیوت پس ;)`,
         KB.main);
     });
     return;
   }
-
   if (text === "🏆 افزایش امتیاز") {
     bot.getMe().then(async me => {
       const refCode = getRefCode(userId);
@@ -595,26 +611,23 @@ bot.on("message", async (msg) => {
     });
     return;
   }
-
   if (text === "اعتبار رایگان") {
     const now = Date.now();
     if ((now - (user.lastFreeCoins || 0)) > 86400000) {
       user.coins += FREE_DAILY_COINS; user.lastFreeCoins = now;
       send(userId, `🎁 <b>${FREE_DAILY_COINS} سکه رایگان</b> دریافت شد!\n💰 موجودی: <b>${user.coins} سکه</b>\n\nفردا دوباره بیا 😊`, KB.main);
     } else {
-      const hours = Math.ceil(((user.lastFreeCoins||0) + 86400000 - now) / 3600000);
+      const hours = Math.ceil(((user.lastFreeCoins || 0) + 86400000 - now) / 3600000);
       send(userId, `⏰ امروز دریافت شده!\n\n<b>${hours} ساعت</b> دیگه بیا 😊`, KB.main);
     }
     return;
   }
-
   if (text === "🔙 برگشت") { s.step = "idle"; send(userId, "حله!\nچه کاری برات انجام بدم؟", KB.main); return; }
-
   if (text === "راهنما") {
     bot.sendMessage(userId,
-      `راهنما 🔍\n\nمن از اینجام که کمکت کنم 😀\nبرای دریافت راهنمایی در مورد هر موضوع، کافیه دکمه شیشه‌ای مورد نظر رو لمس کنی 👇`,
+      `راهنما 🔍\n\nمن از اینجام که کمکت کنم 😀\nبرای دریافت راهنمایی در مورد هر موضوع، کافیه دکمه مورد نظر رو لمس کنی 👇`,
       { reply_markup: { inline_keyboard: [
-        [{ text: "👈 این ربات چیه؟ و به چه درد میخوره؟", callback_data: "help:what" }],
+        [{ text: "👈 این ربات چیه؟", callback_data: "help:what" }],
         [{ text: "👈 چطوری پیام ناشناس دریافت کنم؟", callback_data: "help:receive" }],
         [{ text: "👈 چطوری به مخاطب خاصم وصل بشم؟", callback_data: "help:specific" }],
         [{ text: "👈 چطوری به یه ناشناس تصادفی وصل شیم؟", callback_data: "help:random" }],
@@ -630,7 +643,7 @@ bot.on("message", async (msg) => {
 function forwardMsg(msg, pId) {
   try {
     if (msg.text) bot.sendMessage(pId, msg.text);
-    else if (msg.photo) bot.sendPhoto(pId, msg.photo[msg.photo.length-1].file_id, { caption: msg.caption });
+    else if (msg.photo) bot.sendPhoto(pId, msg.photo[msg.photo.length - 1].file_id, { caption: msg.caption });
     else if (msg.sticker) bot.sendSticker(pId, msg.sticker.file_id);
     else if (msg.voice) bot.sendVoice(pId, msg.voice.file_id);
     else if (msg.video) bot.sendVideo(pId, msg.video.file_id, { caption: msg.caption });
