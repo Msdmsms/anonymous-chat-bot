@@ -239,13 +239,20 @@ function doDisconnect(userId, notifyPartner) {
   const s = sess(userId);
   const pId = s.partnerId;
   waiting.delete(userId);
-  const prev = pId;
   s.step = "idle"; s.partnerId = null; s.disconnectPartnerId = null;
   if (pId) {
-    const ps = sess(pId); ps.step = "idle"; ps.partnerId = null; ps.disconnectPartnerId = null;
-    if (notifyPartner !== false) send(pId, "طرف مقابل چت رو ترک کرد.\n\nاز منوی زیر ادامه بده 👇", KB.main);
+    const ps = sess(pId);
+    ps.partnerId = null;
+    if (notifyPartner !== false) {
+      // Partner also gets the block/report flow
+      ps.step = "confirm_block";
+      ps.disconnectPartnerId = userId;
+      send(pId, "این گپ بسته شد!\n\nنیاز داری این مخاطب رو بلاک کنم که دیگه بهت متصل نشه؟", KB.confirmBlock);
+    } else {
+      ps.step = "idle"; ps.disconnectPartnerId = null;
+    }
   }
-  return prev;
+  return pId;
 }
 
 // ─── /start ───────────────────────────────────────────────────────
